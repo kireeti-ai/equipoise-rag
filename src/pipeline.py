@@ -14,6 +14,7 @@ from src.retriever import retrieve
 from src.reranker import rerank
 from src.reformulator import reformulate_query
 from src.verdict_prompt import build_verdict_prompt
+from src.stance import classify_stance_batch, compute_confidence
 
 
 def run_pipeline(claim: str, method: str = RETRIEVAL_METHOD) -> dict:
@@ -59,8 +60,18 @@ def run_pipeline(claim: str, method: str = RETRIEVAL_METHOD) -> dict:
     reranked = rerank(claim, retrieved, top_k=TOP_K)
     print(f"Reranked to top {len(reranked)}")
 
+    # Step 3b: stance classification
+    print("Classifying evidence stance...")
+    reranked = classify_stance_batch(claim, reranked)
+    confidence_info = compute_confidence(reranked)
+    print(f"Confidence: {confidence_info['confidence_label']} "
+          f"(Score: {confidence_info['confidence_score']:.2f}) "
+          f"| Supports: {confidence_info['supports_count']} "
+          f"Refutes: {confidence_info['refutes_count']} "
+          f"Neutral: {confidence_info['neutral_count']}")
+
     # Step 4: build prompt
-    prompt = build_verdict_prompt(claim, reranked, variant=PROMPT_VARIANT)
+    prompt = build_verdict_prompt(claim, reranked, variant=PROMPT_VARIANT, confidence_info=confidence_info)
 
     # Step 5: generate verdict
     print("Generating verdict...")
@@ -95,6 +106,7 @@ def run_pipeline(claim: str, method: str = RETRIEVAL_METHOD) -> dict:
         "final_top_k": TOP_K,
         "reformulated_query": reformulated,
         "retrieved": reranked,
+        "confidence": confidence_info,
         "verdict": verdict_text
     }
 

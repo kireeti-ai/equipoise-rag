@@ -39,6 +39,10 @@ def rerank(query: str, retrieved: list, top_k: int = 5) -> list:
 
     model = _get_cross_encoder()
 
+    # Keep track of original ranks for diagnostics
+    for i, r in enumerate(retrieved):
+        r["original_rank"] = i + 1
+
     pairs = [[query, r["title"] + " " + r["text"]] for r in retrieved]
     scores = model.predict(pairs)
 
@@ -46,6 +50,11 @@ def rerank(query: str, retrieved: list, top_k: int = 5) -> list:
         result["rerank_score"] = float(scores[i])
 
     reranked = sorted(retrieved, key=lambda x: x["rerank_score"], reverse=True)
+    
+    print("\n--- Reranking Diagnostics ---")
+    for i, r in enumerate(reranked[:top_k]):
+        print(f"Rank {i+1} (was {r.get('original_rank', '?')}): Score {r['rerank_score']:.4f} (Orig: {r.get('score', 0):.4f}) | {r['title'][:60]}...")
+    print("-----------------------------\n")
 
     return reranked[:top_k]
 

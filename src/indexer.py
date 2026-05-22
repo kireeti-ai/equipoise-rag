@@ -19,6 +19,7 @@ import pickle
 
 import chromadb
 import torch
+import re
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
@@ -30,14 +31,44 @@ from src.config import (
 CORPUS_PATH = "data/scifact/data/corpus.jsonl"
 
 
-def load_scifact_abstracts():
+def extract_metadata(text):
+    text_lower = text.lower()
+    
+    # Species heuristics
+    if any(w in text_lower for w in ["human", "patient", "clinical trial", "men", "women", "children"]):
+        species = "human"
+    elif any(w in text_lower for w in ["mice", "mouse", "rat", "murine", "c. elegans", "zebrafish", "animal", "macaque"]):
+        species = "animal"
+    elif any(w in text_lower for w in ["in vitro", "cell line", "cultured"]):
+        species = "in vitro"
+    else:
+        species = "unknown"
+        
+    # Study Type heuristics
+    if "randomized controlled" in text_lower or " rct " in text_lower:
+        study_type = "rct"
+    elif "meta-analysis" in text_lower or "systematic review" in text_lower:
+        study_type = "meta-analysis"
+    elif "review" in text_lower:
+        study_type = "review"
+    elif "case report" in text_lower:
+        study_type = "case report"
+    else:
+        study_type = "unknown"
+        
+    # Year heuristic (first 4 digit number that looks like a recent year)
+    year = "unknown"
+    year_match = re.search(r'\b(19\d{2}|20\d{2})\b', text)
+    if year_match:
+        year = year_match.group(1)
+        
+    return {"species": species, "study_type": study_type, "year": year}
+
+def load_scifact_abstracts(window_size=3, stride=2):
     """
-    Load all abstracts from local corpus.jsonl.
-
-    Key detail: abstract field is a LIST of sentences.
-    They must be joined into one string before indexing.
-
-    Returns list of dicts: id, title, text, full_text.
+    Load all abstracts from local corpus.jsonl and apply sentence-window chunking.
+    Extracts metadata: species, study type, year.
+    Returns list of dicts: chunk_id, title, text, source_abstract, full_text, etc.
     """
     if not os.path.exists(CORPUS_PATH):
         raise FileNotFoundError(
@@ -45,9 +76,9 @@ def load_scifact_abstracts():
             f"Run this to extract: cd data/scifact && tar -xzf data.tar.gz\n"
         )
 
-    print(f"Loading SciFact corpus from {CORPUS_PATH}...")
+    print(f"Loading SciFact corpus from {CORPUS_PATH} with window chunking (size={window_size}, stride={stride})...")
 
-    abstracts = []
+    chunks = []
     with open(CORPUS_PATH) as f:
         for line in f:
             item = json.loads(line.strip())
@@ -55,19 +86,62 @@ def load_scifact_abstracts():
             doc_id = str(item["doc_id"])
             title = item.get("title") or ""
 
-            # abstract is a list of sentences — join into one string
             sentences = item.get("abstract") or []
-            abstract_text = " ".join(sentences) if isinstance(sentences, list) else str(sentences)
+            if isinstance(sentences, str):
+                sentences = [s.strip() + "." for s in sentences.split('.') if s.strip()]
+                
+            full_abstract = " ".join(sentences)
+            meta = extract_metadata(title + " " + full_abstract)
 
-            abstracts.append({
-                "id": doc_id,
-                "title": title,
-                "text": abstract_text,
-                "full_text": (title + " " + abstract_text).strip()
-            })
+            # If abstract is shorter than window, just make one chunk
+            if len(sentences) <= window_size:
+                chunk_text = " ".join(sentences)
+                chunks.append({
+                    "id": f"{doc_id}_0",
+                    "doc_id": doc_id,
+                    "title": title,
+                    "text": chunk_text,
+                    "source_abstract": full_abstract,
+                    "chunk_type": "passage",
+                    "full_text": (title + " " + chunk_text).strip(),
+                    **meta
+                })
+                continue
+                
+            # Sliding window chunking
+            last_idx = 0
+            for i in range(0, len(sentences) - window_size + 1, stride):
+                window = sentences[i:i+window_size]
+                chunk_text = " ".join(window)
+                chunks.append({
+                    "id": f"{doc_id}_{i}",
+                    "doc_id": doc_id,
+                    "title": title,
+                    "text": chunk_text,
+                    "source_abstract": full_abstract,
+                    "chunk_type": "passage",
+                    "full_text": (title + " " + chunk_text).strip(),
+                    **meta
+                })
+                last_idx = i
 
-    print(f"Loaded {len(abstracts)} abstracts")
-    return abstracts
+            # Ensure we don't miss the end if stride skipped it
+            if last_idx + window_size < len(sentences):
+                window = sentences[-window_size:]
+                chunk_text = " ".join(window)
+                chunks.append({
+                    "id": f"{doc_id}_end",
+                    "doc_id": doc_id,
+                    "title": title,
+                    "text": chunk_text,
+                    "source_abstract": full_abstract,
+                    "chunk_type": "passage",
+                    "full_text": (title + " " + chunk_text).strip(),
+                    **meta
+                })
+
+    print(f"Generated {len(chunks)} chunks from corpus")
+    return chunks
 
 
 def build_chroma_index(abstracts):
@@ -99,7 +173,16 @@ def build_chroma_index(abstracts):
         batch = abstracts[i:i + batch_size]
         texts = [a["full_text"] for a in batch]
         ids = [a["id"] for a in batch]
-        metadatas = [{"title": a["title"], "text": a["text"]} for a in batch]
+        metadatas = [{
+            "doc_id": a["doc_id"],
+            "title": a["title"], 
+            "text": a["text"],
+            "source_abstract": a["source_abstract"],
+            "chunk_type": a["chunk_type"],
+            "species": a["species"],
+            "study_type": a["study_type"],
+            "year": a["year"]
+        } for a in batch]
 
         embeddings = embedding_model.encode(
             texts,
@@ -111,7 +194,7 @@ def build_chroma_index(abstracts):
 
         collection.add(ids=ids, embeddings=embeddings, metadatas=metadatas)
 
-    print(f"ChromaDB index built — {collection.count()} abstracts indexed")
+    print(f"ChromaDB index built — {collection.count()} chunks indexed")
     return collection
 
 
@@ -127,7 +210,7 @@ def build_bm25_index(abstracts):
     with open(f"{CHROMA_DB_PATH}/abstracts.pkl", "wb") as f:
         pickle.dump(abstracts, f)
 
-    print(f"BM25 index built — {len(abstracts)} abstracts saved")
+    print(f"BM25 index built — {len(abstracts)} chunks saved")
     return bm25
 
 
@@ -144,15 +227,15 @@ def verify_index():
     chroma_count = collection.count()
     bm25_count = len(abstracts)
 
-    print(f"ChromaDB : {chroma_count} abstracts")
-    print(f"BM25     : {bm25_count} abstracts")
+    print(f"ChromaDB : {chroma_count} chunks")
+    print(f"BM25     : {bm25_count} chunks")
 
-    assert chroma_count == bm25_count == 5183, (
-        f"Count mismatch — expected 5183, got ChromaDB:{chroma_count} BM25:{bm25_count}"
+    assert chroma_count == bm25_count, (
+        f"Count mismatch — got ChromaDB:{chroma_count} BM25:{bm25_count}"
     )
 
     sample = abstracts[0]
-    print(f"\nSample abstract:")
+    print(f"\nSample chunk:")
     print(f"  ID    : {sample['id']}")
     print(f"  Title : {sample['title'][:80]}")
     print(f"  Text  : {sample['text'][:120]}...")
